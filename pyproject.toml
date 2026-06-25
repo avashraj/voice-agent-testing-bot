@@ -8,4 +8,5 @@ dependencies = [
     "fastapi[standard]>=0.138.1",
     "python-dotenv>=1.2.2",
     "twilio>=9.10.9",
+    "websockets>=16.0",
 ]
