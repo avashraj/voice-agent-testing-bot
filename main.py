@@ -14,6 +14,6 @@ app = FastAPI()
 async def health():
     return {"message": "healthy"}
 
-@app.get("/voice")
+@app.api_route("/voice", methods=["GET", "POST"])
 async def voice():
     return Response(content=say_something(), media_type="application/xml")
