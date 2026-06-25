@@ -4,4 +4,7 @@ version = "0.1.0"
 description = "Voice Bot testing via another voice bot"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "fastapi[standard]>=0.138.1",
+    "twilio>=9.10.9",
+]
