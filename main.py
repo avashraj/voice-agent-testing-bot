@@ -7,9 +7,11 @@ from pathlib import Path
 import httpx
 import websockets
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from twilio.twiml.voice_response import Connect, VoiceResponse
+
+from scenarios import get_scenario
 
 load_dotenv()
 
@@ -31,7 +33,7 @@ TRANSCRIPTS_DIR = Path("transcripts")
 REALTIME_MODEL = "gpt-realtime"
 REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-SCENARIO_PROMPT = (
+DEFAULT_PROMPT = (
     "You are the PATIENT, and you placed this call to a medical clinic to "
     "schedule a follow-up appointment. The person you are speaking with is "
     "the clinic staff. Never act as the clinic or receptionist, even if they "
@@ -56,9 +58,16 @@ app = FastAPI()
 async def health():
     return {"message": "healthy"}
 
+WS_BASE = "wss://alica-bridlewise-catatonically.ngrok-free.dev/ws"
+
+
 @app.api_route("/voice", methods=["GET", "POST"])
-async def voice():
-    ws_url = "wss://alica-bridlewise-catatonically.ngrok-free.dev/ws"
+async def voice(request: Request):
+    # run_suite sets ?scenario=<id>&leg=<n> on the /voice URL. Twilio preserves
+    # the query string, so thread both onto the <Stream> URL for /ws to read.
+    scenario_id = request.query_params.get("scenario", "")
+    leg = request.query_params.get("leg", "0")
+    ws_url = f"{WS_BASE}?scenario={scenario_id}&leg={leg}"
     return Response(content=stream_twiml(ws_url), media_type="application/xml")
 
 @app.post("/recording")
@@ -91,22 +100,24 @@ def write_transcript(state):
         return
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     call_sid = state["call_sid"] or "unknown"
-    out_path = TRANSCRIPTS_DIR / f"{state['scenario_id']}_{call_sid}.json"
+    leg = state.get("leg", 0)
+    out_path = TRANSCRIPTS_DIR / f"{state['scenario_id']}_leg{leg}_{call_sid}.json"
     out_path.write_text(json.dumps({
         "scenario_id": state["scenario_id"],
+        "leg": leg,
         "call_sid": call_sid,
         "turns": state["turns"],
     }, indent=2))
     print(f"saved transcript {out_path} ({len(state['turns'])} turns)")
 
 
-async def configure_realtime(openai_ws):
+async def configure_realtime(openai_ws, instructions):
     # GA schema. Both legs are pcmu (g711 u-law) 8kHz -> no transcoding.
     await openai_ws.send(json.dumps({
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": SCENARIO_PROMPT,
+            "instructions": instructions,
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
@@ -130,7 +141,13 @@ async def configure_realtime(openai_ws):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    print("Twilio /ws accepted, connecting to OpenAI realtime...")
+
+    scenario_id = websocket.query_params.get("scenario") or "unknown"
+    leg = int(websocket.query_params.get("leg") or 0)
+    scenario = get_scenario(scenario_id)
+    instructions = scenario.patient_prompt(leg) if scenario else DEFAULT_PROMPT
+    print(f"Twilio /ws accepted scenario={scenario_id} leg={leg}, "
+          "connecting to OpenAI realtime...")
 
     try:
         async with websockets.connect(
@@ -140,13 +157,14 @@ async def websocket_endpoint(websocket: WebSocket):
             },
         ) as openai_ws:
             print("OpenAI realtime connected.")
-            await configure_realtime(openai_ws)
+            await configure_realtime(openai_ws, instructions)
 
             # Shared mutable state between the two pump tasks.
             state = {
                 "stream_sid": None,
                 "call_sid": None,
-                "scenario_id": "unknown",  # threaded from /voice in #7
+                "scenario_id": scenario_id,
+                "leg": leg,
                 "response_active": False,
                 "turns": [],  # [{"role": "clinic"|"patient", "text": str}]
             }
