@@ -37,7 +37,9 @@ SCENARIO_PROMPT = (
     "the clinic staff. Never act as the clinic or receptionist, even if they "
     "say things that sound like they expect you to. Always speak in English. "
     "Speak naturally and conversationally. Keep replies short. Wait for the "
-    "other person to finish before responding."
+    "other person to finish before responding. Do not interrupt. Ignore "
+    "recorded disclaimers, hold music, and automated menu prompts; wait for a "
+    "real person or agent to ask you something before you speak."
 )
 
 def stream_twiml(ws_url: str):
@@ -109,7 +111,12 @@ async def configure_realtime(openai_ws):
                 "input": {
                     "format": {"type": "audio/pcmu"},
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
-                    "turn_detection": {"type": "server_vad"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.6,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 800,
+                    },
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
@@ -201,7 +208,12 @@ async def websocket_endpoint(websocket: WebSocket):
                         }))
                         if state["response_active"]:
                             await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                            # Avoid a second cancel before response.done lands.
+                            state["response_active"] = False
                     elif etype == "error":
+                        # Benign barge-in race; flag already cleared. Skip noise.
+                        if event.get("error", {}).get("code") == "response_cancel_not_active":
+                            continue
                         print(f"realtime error: {event}")
 
             # First task to finish (e.g. caller hangs up) cancels the other so
