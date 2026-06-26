@@ -26,6 +26,7 @@ if not OPENAI_API_KEY:
     raise Exception("add openai api key to .env")
 
 RECORDINGS_DIR = Path("recordings")
+TRANSCRIPTS_DIR = Path("transcripts")
 
 REALTIME_MODEL = "gpt-realtime"
 REALTIME_URL = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
@@ -81,6 +82,22 @@ async def recording(
     return Response(status_code=204)
 
 
+def write_transcript(state):
+    # Persist the two-speaker transcript for the judge (#9).
+    if not state["turns"]:
+        print("no transcript turns captured, skipping write")
+        return
+    TRANSCRIPTS_DIR.mkdir(exist_ok=True)
+    call_sid = state["call_sid"] or "unknown"
+    out_path = TRANSCRIPTS_DIR / f"{state['scenario_id']}_{call_sid}.json"
+    out_path.write_text(json.dumps({
+        "scenario_id": state["scenario_id"],
+        "call_sid": call_sid,
+        "turns": state["turns"],
+    }, indent=2))
+    print(f"saved transcript {out_path} ({len(state['turns'])} turns)")
+
+
 async def configure_realtime(openai_ws):
     # GA schema. Both legs are pcmu (g711 u-law) 8kHz -> no transcoding.
     await openai_ws.send(json.dumps({
@@ -91,6 +108,7 @@ async def configure_realtime(openai_ws):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
+                    "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {"type": "server_vad"},
                 },
                 "output": {
@@ -118,7 +136,13 @@ async def websocket_endpoint(websocket: WebSocket):
             await configure_realtime(openai_ws)
 
             # Shared mutable state between the two pump tasks.
-            state = {"stream_sid": None, "response_active": False}
+            state = {
+                "stream_sid": None,
+                "call_sid": None,
+                "scenario_id": "unknown",  # threaded from /voice in #7
+                "response_active": False,
+                "turns": [],  # [{"role": "clinic"|"patient", "text": str}]
+            }
 
             async def twilio_to_openai():
                 # Twilio media frames -> OpenAI input audio buffer.
@@ -129,6 +153,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         event = message["event"]
                         if event == "start":
                             state["stream_sid"] = message["start"]["streamSid"]
+                            state["call_sid"] = message["start"].get("callSid")
                             print(f"start streamSid={state['stream_sid']}")
                         elif event == "media":
                             await openai_ws.send(json.dumps({
@@ -152,6 +177,16 @@ async def websocket_endpoint(websocket: WebSocket):
                         state["response_active"] = True
                     elif etype == "response.done":
                         state["response_active"] = False
+                    elif etype == "response.output_audio_transcript.done":
+                        # Our PATIENT bot's spoken turn.
+                        state["turns"].append(
+                            {"role": "patient", "text": event.get("transcript", "")}
+                        )
+                    elif etype == "conversation.item.input_audio_transcription.completed":
+                        # The CLINIC bot's spoken turn (async transcription).
+                        state["turns"].append(
+                            {"role": "clinic", "text": event.get("transcript", "")}
+                        )
                     elif etype == "response.output_audio.delta":
                         await websocket.send_text(json.dumps({
                             "event": "media",
@@ -181,6 +216,7 @@ async def websocket_endpoint(websocket: WebSocket):
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
+            write_transcript(state)
             print("call torn down")
     except Exception:
         print("=== /ws handler crashed (this is what plays the Twilio app error) ===")
